@@ -1,0 +1,260 @@
+1: /**
+2:  * ============================================================
+3:  * MODELO - Pedido y Pago con MySQL (MVC)
+4:  * ============================================================
+5:  * Cumplimiento de normas:
+6:  * - ISO 9001:2015 - Gestión de pedidos documentada
+7:  * - IEEE 730 - Validación de transacciones
+8:  * - ISO/IEC 25000 (SQuaRE) - Integridad de datos
+9:  * - ISO/IEC 20000 - Gestión de servicios
+10:  * - ISO/IEC 27001 - Seguridad en transacciones
+11:  * - PCI-DSS - Estándares de seguridad en pagos (referencia)
+12:  * ============================================================
+13:  */
+14: 
+15: import { query, transaction } from '../mysql';
+16: import type {
+17:   Pedido,
+18:   DetallePedido,
+19:   Pago,
+20:   DatosPago,
+21:   UsuarioSeguro,
+22: } from '@/lib/models/types';
+23: import { CartModelMySQL } from './cart.mysql';
+24: import { UserModelMySQL } from './user.mysql';
+25: import { RowDataPacket, ResultSetHeader } from 'mysql2';
+26: 
+27: /**
+28:  * Interfaces para resultados de MySQL
+29:  */
+30: interface PedidoRow extends RowDataPacket {
+31:   id_pedido: string;
+32:   fecha: string;
+33:   id_usuario: string;
+34:   direccion_calle?: string;
+35:   direccion_ciudad?: string;
+36:   direccion_departamento?: string;
+37:   direccion_codigo_postal?: string;
+38:   direccion_telefono?: string;
+39:   direccion_referencias?: string;
+40: }
+41: 
+42: interface DetallePedidoRow extends RowDataPacket {
+43:   id_detalle: string;
+44:   cantidad: number;
+45:   precio: number;
+46:   id_pedido: string;
+47:   id_producto: string;
+48:   tallaSeleccionada?: string;
+49:   producto_nombre?: string;
+50:   producto_imagen?: string;
+51: }
+52: 
+53: interface PagoRow extends RowDataPacket {
+54:   id_pago: string;
+55:   metodo: string;
+56:   estado: string;
+57:   id_pedido: string;
+58: }
+59: 
+60: /**
+61:  * Generador de IDs únicos (máximo 10 caracteres para MySQL VARCHAR(10))
+62:  */
+63: function generarId(prefijo: string): string {
+64:   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+65:   let random = '';
+66:   for (let i = 0; i < 7; i++) {
+67:     random += chars.charAt(Math.floor(Math.random() * chars.length));
+68:   }
+69:   return `${prefijo.substring(0, 3)}${random}`;
+70: }
+71: 
+72: let cachedTallaPedidoColumn: boolean | null = null;
+73: 
+74: async function supportsTallaPedidoColumn(): Promise<boolean> {
+75:   if (cachedTallaPedidoColumn !== null) {
+76:     return cachedTallaPedidoColumn;
+77:   }
+78: 
+79:   try {
+80:     const rows = await query<RowDataPacket[]>(
+81:       `SELECT COUNT(*) as count
+82:        FROM information_schema.columns
+83:        WHERE table_schema = DATABASE()
+84:          AND table_name = 'detalle_pedido'
+85:          AND column_name = 'tallaSeleccionada'`
+86:     );
+87: 
+88:     cachedTallaPedidoColumn = Number(rows[0]?.count || 0) > 0;
+89:   } catch (error) {
+90:     console.error('[OrderModel] No se pudo verificar columna tallaSeleccionada en detalle_pedido:', error);
+91:     cachedTallaPedidoColumn = false;
+92:   }
+93: 
+94:   return cachedTallaPedidoColumn;
+95: }
+96: 
+97: /**
+98:  * Clase OrderModel - Operaciones de pedidos con MySQL
+99:  */
+100: export class OrderModelMySQL {
+101:   /**
+102:    * Crear pedido desde carrito
+103:    */
+104:   static async createFromCart(
+105:     id_usuario: string,
+106:     datosPago: DatosPago
+107:   ): Promise<{ success: boolean; pedido?: Pedido; message: string }> {
+108:     // Obtener carrito del usuario
+109:     const carrito = await CartModelMySQL.getCartCompleto(id_usuario);
+110: 
+111:     if (carrito.items.length === 0) {
+112:       return { success: false, message: 'El carrito está vacío' };
+113:     }
+114: 
+115:     // Validar stock de todos los productos
+116:     for (const item of carrito.items) {
+117:       const inventario = await query<RowDataPacket[]>(
+118:         'SELECT stock FROM inventario WHERE id_producto = ?',
+119:         [item.id_producto]
+120:       );
+121: 
+122:       if (inventario.length === 0 || inventario[0].stock < item.cantidad) {
+123:         return {
+124:           success: false,
+125:           message: `Stock insuficiente para: ${item.producto?.nombre}`,
+126:         };
+127:       }
+128:     }
+129: 
+130:     const id_pedido = generarId('PED');
+131:     try {
+132:       const hasTallaColumn = await supportsTallaPedidoColumn();
+133: 
+134:       // Iniciar transacción
+135:       const queries: { sql: string; params: unknown[] }[] = [];
+136: 
+137:         // Crear pedido
+138:         const pedidoColumns = ['id_pedido', 'id_usuario'];
+139:         const pedidoParams: unknown[] = [id_pedido, id_usuario];
+140: 
+141:         if (datosPago.direccion_envio) {
+142:           pedidoColumns.push(
+143:             'direccion_calle',
+144:             'direccion_ciudad',
+145:             'direccion_departamento',
+146:             'direccion_codigo_postal',
+147:             'direccion_telefono',
+148:             'direccion_referencias'
+149:           );
+150:           pedidoParams.push(
+151:             datosPago.direccion_envio.calle || null,
+152:             datosPago.direccion_envio.ciudad || null,
+153:             datosPago.direccion_envio.departamento || null,
+154:             datosPago.direccion_envio.codigo_postal || null,
+155:             datosPago.direccion_envio.telefono || null,
+156:             datosPago.direccion_envio.referencias || null
+157:           );
+158:         }
+159: 
+160:         queries.push({
+161:           sql: `INSERT INTO pedido (${pedidoColumns.join(', ')}) VALUES (${pedidoColumns
+162:             .map(() => '?')
+163:             .join(', ')})`,
+164:           params: pedidoParams,
+165:         });
+166: 
+167:         // Crear detalles y actualizar inventario
+168:         for (const item of carrito.items) {
+169:           const id_detalle = generarId('DTP');
+170: 
+171:           if (hasTallaColumn) {
+172:             queries.push({
+173:               sql: `INSERT INTO detalle_pedido (id_detalle, cantidad, precio, id_pedido, id_producto, tallaSeleccionada) VALUES (?, ?, ?, ?, ?, ?)`,
+174:               params: [
+175:                 id_detalle,
+176:                 item.cantidad,
+177:                 item.producto?.precio || 0,
+178:                 id_pedido,
+179:                 item.id_producto,
+180:                 item.tallaSeleccionada ?? null,
+181:               ],
+182:             });
+183:           } else {
+184:             queries.push({
+185:               sql: `INSERT INTO detalle_pedido (id_detalle, cantidad, precio, id_pedido, id_producto) VALUES (?, ?, ?, ?, ?)`,
+186:               params: [
+187:                 id_detalle,
+188:                 item.cantidad,
+189:                 item.producto?.precio || 0,
+190:                 id_pedido,
+191:                 item.id_producto,
+192:               ],
+193:             });
+194:           }
+195: 
+196:           queries.push({
+197:             sql: 'UPDATE inventario SET stock = stock - ? WHERE id_producto = ?',
+198:             params: [item.cantidad, item.id_producto],
+199:           });
+200:         }
+201: 
+202:         await transaction(queries);
+203: 
+204:       // Procesar pago
+205:       const resultadoPago = await PaymentModelMySQL.processPayment(id_pedido, datosPago);
+206:       // Vaciar carrito
+207:       await CartModelMySQL.clearCart(id_usuario);
+208: 
+209:       // Retornar pedido completo
+210:       const pedido = await this.findById(id_pedido);
+211: 
+212:       return {
+213:         success: true,
+214:         pedido: pedido || undefined,
+215:         message: 'Pedido creado exitosamente',
+216:       };
+217:     } catch (error) {
+218:       console.error('[OrderModel] Error al crear pedido:', error);
+219:       return { success: false, message: 'Error al procesar el pedido' };
+220:     }
+221:   }
+222: 
+223:   /**
+224:    * Obtener pedido por ID con detalles
+225:    */
+226:   static async findById(id: string): Promise<Pedido | null> {
+227:     const pedidos = await query<PedidoRow[]>(
+228:       'SELECT * FROM pedido WHERE id_pedido = ?',
+229:       [id]
+230:     );
+231: 
+232:     if (pedidos.length === 0) return null;
+233: 
+234:     const pedido = pedidos[0];
+235: 
+236:     // Obtener detalles
+237:     const detalles = await query<DetallePedidoRow[]>(
+238:       `SELECT dp.*, p.nombre as producto_nombre, p.imagen as producto_imagen
+239:        FROM detalle_pedido dp
+240:        LEFT JOIN producto p ON dp.id_producto = p.id_producto
+241:        WHERE dp.id_pedido = ?`,
+242:       [id]
+243:     );
+244: 
+245:     // Obtener pago
+246:     const pagos = await query<PagoRow[]>(
+247:       'SELECT * FROM pago WHERE id_pedido = ?',
+248:       [id]
+249:     );
+250: 
+251:     // Obtener usuario
+252:     const usuario = await UserModelMySQL.findById(pedido.id_usuario);
+253:     const usuarioSeguro = usuario ? await UserModelMySQL.toSafeUser(usuario) : undefined;
+254: 
+255:     const detallesFormateados: DetallePedido[] = detalles.map((d) => ({
+256:       id_detalle: d.id_detalle,
+257:       cantidad: d.cantidad,
+258:       precio: Number(d.precio),
+259:       id_pedido: d.id_pedido,
+260:       id_producto: d.id_producto,
